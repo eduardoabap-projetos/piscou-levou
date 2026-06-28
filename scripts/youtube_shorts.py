@@ -1,266 +1,243 @@
 #!/usr/bin/env python3
 """
 PiscouLevou — YouTube Shorts Auto-Post
-Gera um vídeo vertical (1080x1920) com a imagem do produto + overlay de preço/desconto
-e faz upload para o canal do YouTube como Short.
-
-Dependências: pip install requests google-auth google-auth-oauthlib google-api-python-client pillow
+Gera vídeo vertical 1080x1920 com Pillow (composição) + FFmpeg (encoding)
+e faz upload para o YouTube como Short.
 """
 
-import os
-import sys
-import json
-import time
-import subprocess
-import tempfile
-import requests
+import os, sys, json, time, subprocess, tempfile, io, textwrap, requests
 from pathlib import Path
 from datetime import datetime, timezone
 
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 # ─── Configurações ────────────────────────────────────────────────────────────
-SUPABASE_URL           = os.environ["SUPABASE_URL"]
-SUPABASE_SERVICE_KEY   = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-YOUTUBE_CLIENT_ID      = os.environ["YOUTUBE_CLIENT_ID"]
-YOUTUBE_CLIENT_SECRET  = os.environ["YOUTUBE_CLIENT_SECRET"]
-YOUTUBE_REFRESH_TOKEN  = os.environ["YOUTUBE_REFRESH_TOKEN"]
-SITE_URL               = "https://www.piscoulevou.com.br"
+SUPABASE_URL          = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_KEY  = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+YOUTUBE_CLIENT_ID     = os.environ["YOUTUBE_CLIENT_ID"]
+YOUTUBE_CLIENT_SECRET = os.environ["YOUTUBE_CLIENT_SECRET"]
+YOUTUBE_REFRESH_TOKEN = os.environ["YOUTUBE_REFRESH_TOKEN"]
+SITE_URL              = "https://www.piscoulevou.com.br"
 
-SUPABASE_HEADERS = {
+HEADERS = {
     "apikey":        SUPABASE_SERVICE_KEY,
     "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
     "Content-Type":  "application/json",
 }
 
+def log(msg): print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
-def log(msg: str):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+def format_brl(v: float) -> str:
+    return f"R$ {v:_.2f}".replace("_", ".").replace(".", ",", 1) if "." not in f"{v:.2f}" else \
+           "R$ " + f"{v:.2f}".replace(".", ",")
 
+def format_brl(v: float) -> str:
+    s = f"{v:.2f}"
+    intpart, dec = s.split(".")
+    # Adiciona separador de milhar
+    result = ""
+    for i, c in enumerate(reversed(intpart)):
+        if i > 0 and i % 3 == 0:
+            result = "." + result
+        result = c + result
+    return f"R$ {result},{dec}"
 
-# ─── Supabase helpers ─────────────────────────────────────────────────────────
+# ─── Supabase ─────────────────────────────────────────────────────────────────
 
 def get_last_platform() -> str:
-    r = requests.get(
-        f"{SUPABASE_URL}/rest/v1/youtube_settings?key=eq.last_posted_platform&select=value",
-        headers=SUPABASE_HEADERS,
-    )
-    data = r.json()
-    return data[0]["value"] if data else "shopee"
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/youtube_settings?key=eq.last_posted_platform&select=value", headers=HEADERS)
+    d = r.json()
+    return d[0]["value"] if d else "shopee"
 
+def set_last_platform(p: str):
+    requests.patch(f"{SUPABASE_URL}/rest/v1/youtube_settings?key=eq.last_posted_platform",
+                   headers=HEADERS, json={"value": p, "updated_at": datetime.now(timezone.utc).isoformat()})
 
-def set_last_platform(platform: str):
-    requests.patch(
-        f"{SUPABASE_URL}/rest/v1/youtube_settings?key=eq.last_posted_platform",
-        headers=SUPABASE_HEADERS,
-        json={"value": platform, "updated_at": datetime.now(timezone.utc).isoformat()},
-    )
-
-
-def pick_product(platform: str) -> dict | None:
-    """Busca produto ativo, não postado no YouTube recentemente."""
-    # Produtos não postados no YouTube ou postados há mais de 30 dias
+def pick_product(platform: str):
     r = requests.get(
         f"{SUPABASE_URL}/rest/v1/products"
         f"?select=id,codigo_identificador,title,price,original_price,discount_pct,image_url,affiliate_link,subcategory_name,platform"
-        f"&status=eq.active"
-        f"&platform=eq.{platform}"
-        f"&price=gte.10"
-        f"&youtube_posted_at=is.null"
-        f"&order=discount_pct.desc.nullslast,price.asc"
-        f"&limit=1",
-        headers=SUPABASE_HEADERS,
-    )
-    prods = r.json()
-    if prods:
-        return prods[0]
-    # Fallback: qualquer produto dessa plataforma (postado há mais tempo)
+        f"&status=eq.active&platform=eq.{platform}&price=gte.10"
+        f"&youtube_posted_at=is.null&order=discount_pct.desc.nullslast,price.asc&limit=1",
+        headers=HEADERS)
+    p = r.json()
+    if p: return p[0]
     r2 = requests.get(
         f"{SUPABASE_URL}/rest/v1/products"
         f"?select=id,codigo_identificador,title,price,original_price,discount_pct,image_url,affiliate_link,subcategory_name,platform"
-        f"&status=eq.active"
-        f"&platform=eq.{platform}"
-        f"&price=gte.10"
-        f"&order=youtube_posted_at.asc.nullslast"
-        f"&limit=1",
-        headers=SUPABASE_HEADERS,
-    )
-    prods2 = r2.json()
-    return prods2[0] if prods2 else None
-
+        f"&status=eq.active&platform=eq.{platform}&price=gte.10"
+        f"&order=youtube_posted_at.asc.nullslast&limit=1",
+        headers=HEADERS)
+    p2 = r2.json()
+    return p2[0] if p2 else None
 
 def mark_posted(product_id: str):
-    requests.patch(
-        f"{SUPABASE_URL}/rest/v1/products?id=eq.{product_id}",
-        headers=SUPABASE_HEADERS,
-        json={"youtube_posted_at": datetime.now(timezone.utc).isoformat()},
-    )
+    requests.patch(f"{SUPABASE_URL}/rest/v1/products?id=eq.{product_id}",
+                   headers=HEADERS, json={"youtube_posted_at": datetime.now(timezone.utc).isoformat()})
 
+# ─── Geração de imagem com Pillow ─────────────────────────────────────────────
 
-# ─── Geração de vídeo com FFmpeg ──────────────────────────────────────────────
+FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+FONT_REG  = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
-def format_brl(v: float) -> str:
-    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+def load_font(path: str, size: int):
+    try:    return ImageFont.truetype(path, size)
+    except: return ImageFont.load_default()
 
+def draw_centered_text(draw, text: str, y: int, font, color, W: int, shadow=True):
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw = bbox[2] - bbox[0]
+    x = (W - tw) // 2
+    if shadow:
+        draw.text((x+2, y+2), text, font=font, fill=(0,0,0,200))
+    draw.text((x, y), text, font=font, fill=color)
+    return bbox[3] - bbox[1]  # altura do texto
 
-def create_short_video(product: dict, output_path: str) -> bool:
-    """Cria vídeo vertical 1080x1920 usando FFmpeg."""
-    image_url = product["image_url"]
-    price     = product["price"]
-    orig      = product.get("original_price")
-    disc_pct  = product.get("discount_pct", 0) or 0
+def create_frame_image(product: dict, out_path: str) -> bool:
+    """Cria imagem composta 1080x1920 com Pillow."""
+    W, H = 1080, 1920
+    price    = product["price"]
+    orig     = product.get("original_price")
+    disc_pct = product.get("discount_pct") or 0
     if orig and orig > price:
         disc_pct = round((orig - price) / orig * 100)
 
-    title = product["title"]
-    # Trunca título para caber no vídeo
-    if len(title) > 50:
-        title = title[:47] + "..."
+    is_shopee = product.get("platform") == "shopee"
+    plat_label = "SHOPEE" if is_shopee else "MERCADO LIVRE"
+    plat_bg    = (238, 77, 45)  if is_shopee else (255, 210, 0)
+    plat_fg    = (255,255,255)  if is_shopee else (0,0,0)
 
-    plataforma = "SHOPEE" if product.get("platform") == "shopee" else "MERCADO LIVRE"
-    price_str  = format_brl(price)
-    orig_str   = format_brl(orig) if orig and orig > price else ""
-    codigo     = product.get("codigo_identificador", "")
-
-    # Download da imagem do produto
-    img_path = output_path.replace(".mp4", "_product.jpg")
+    # Baixa imagem do produto
     try:
-        img_resp = requests.get(image_url, timeout=15)
-        with open(img_path, "wb") as f:
-            f.write(img_resp.content)
+        resp = requests.get(product["image_url"], timeout=15)
+        prod_img = Image.open(io.BytesIO(resp.content)).convert("RGB")
     except Exception as e:
         log(f"❌ Erro ao baixar imagem: {e}")
         return False
 
-    # Filtros FFmpeg para criar vídeo vertical profissional
-    # Fundo: imagem borrada (1080x1920)
-    # Centro: imagem do produto (900x900 centralizada)
-    # Overlay de texto: título, preço, desconto, plataforma, CTA
-    
-    discount_text = f"{disc_pct}% OFF" if disc_pct >= 5 else ""
-    price_text    = price_str
-    orig_text     = f"De: {orig_str}" if orig_str else ""
-    
-    # Cores por plataforma
-    if product.get("platform") == "shopee":
-        plat_color = "EE4D2D"  # Shopee laranja
-    else:
-        plat_color = "FFE600"  # ML amarelo (cor hex sem #)
+    # ── Background borrado ──────────────────────────────────────────────────
+    bg = prod_img.resize((W, H), Image.LANCZOS).filter(ImageFilter.GaussianBlur(25))
+    canvas = bg.convert("RGBA")
+    # Escurece background
+    canvas.alpha_composite(Image.new("RGBA", (W, H), (0, 0, 0, 170)))
 
-    # Construção do filtro complexo
-    vf_parts = [
-        # Background borrado
-        "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,boxblur=15:5,brightness=0.4[bg]",
-        
-        # Produto centralizado
-        "[0:v]scale=900:900:force_original_aspect_ratio=decrease,"
-        "pad=900:900:(ow-iw)/2:(oh-ih)/2:color=white@0[fg]",
-        
-        # Composição base
-        "[bg][fg]overlay=(W-w)/2:300[base]",
-        
-        # Badge de plataforma (topo)
-        f"[base]drawtext="
-        f"text='{plataforma}':"
-        f"fontsize=42:fontcolor=black:"
-        f"box=1:boxcolor=0x{plat_color}@1:boxborderw=20:"
-        f"x=(w-text_w)/2:y=100[withplat]",
-        
-        # Título do produto
-        f"[withplat]drawtext="
-        f"text='{title.replace(chr(39), chr(96))}':"
-        f"fontsize=30:fontcolor=white:"
-        f"box=1:boxcolor=black@0.6:boxborderw=10:"
-        f"x=(w-text_w)/2:y=1280:"
-        f"line_spacing=5[withtitle]",
-    ]
-    
-    # Preço com desconto
-    if orig_str and disc_pct >= 5:
-        vf_parts.append(
-            f"[withtitle]drawtext="
-            f"text='{orig_text}':"
-            f"fontsize=32:fontcolor=gray:"
-            f"x=(w-text_w)/2:y=1390[withorig]"
-        )
-        vf_parts.append(
-            f"[withorig]drawtext="
-            f"text='{discount_text}':"
-            f"fontsize=48:fontcolor=white:"
-            f"box=1:boxcolor=red@0.9:boxborderw=15:"
-            f"x=50:y=1440[withdisc]"
-        )
-        vf_parts.append(
-            f"[withdisc]drawtext="
-            f"text='{price_text}':"
-            f"fontsize=72:fontcolor=white:fontweight=bold:"
-            f"box=1:boxcolor=black@0.5:boxborderw=10:"
-            f"x=(w-text_w)/2:y=1500[withprice]"
-        )
-        last = "withprice"
-    else:
-        vf_parts.append(
-            f"[withtitle]drawtext="
-            f"text='{price_text}':"
-            f"fontsize=72:fontcolor=white:fontweight=bold:"
-            f"box=1:boxcolor=black@0.5:boxborderw=10:"
-            f"x=(w-text_w)/2:y=1440[withprice]"
-        )
-        last = "withprice"
+    draw = ImageDraw.Draw(canvas)
 
-    # CTA - Call to action
-    vf_parts.append(
-        f"[{last}]drawtext="
-        f"text='Ver oferta: www.piscoulevou.com.br':"
-        f"fontsize=28:fontcolor=white:"
-        f"box=1:boxcolor=black@0.7:boxborderw=12:"
-        f"x=(w-text_w)/2:y=1820[final]"
-    )
+    # ── Fontes ─────────────────────────────────────────────────────────────
+    f_badge  = load_font(FONT_BOLD, 44)
+    f_title  = load_font(FONT_BOLD, 34)
+    f_orig   = load_font(FONT_REG,  36)
+    f_disc   = load_font(FONT_BOLD, 50)
+    f_price  = load_font(FONT_BOLD, 88)
+    f_cta    = load_font(FONT_REG,  30)
 
-    vf_filter = ";".join(vf_parts)
-    # O último estágio é "final" — indicamos para o mapeamento de saída
-    # mas precisamos checar se o último estágio está correto
-    # Simplificando: usar a última label
-    
+    # ── Badge de plataforma (topo) ──────────────────────────────────────────
+    pad = 24
+    bb  = draw.textbbox((0,0), plat_label, font=f_badge)
+    bw, bh = bb[2]-bb[0]+pad*2, bb[3]-bb[1]+pad
+    bx = (W - bw) // 2
+    by = 80
+    draw.rounded_rectangle([bx, by, bx+bw, by+bh], radius=14, fill=plat_bg)
+    draw.text((bx+pad, by+pad//2), plat_label, font=f_badge, fill=plat_fg)
+
+    # ── Imagem do produto (quadrado branco centralizado) ───────────────────
+    prod_size = 880
+    prod_box  = Image.new("RGB", (prod_size, prod_size), (255,255,255))
+    prod_img.thumbnail((prod_size, prod_size), Image.LANCZOS)
+    px_ = (prod_size - prod_img.width)  // 2
+    py_ = (prod_size - prod_img.height) // 2
+    prod_box.paste(prod_img, (px_, py_))
+    canvas.paste(prod_box.convert("RGBA"), ((W-prod_size)//2, by+bh+30))
+
+    # ── Posição Y após a imagem ────────────────────────────────────────────
+    ty = by + bh + 30 + prod_size + 28
+
+    # ── Título (até 3 linhas) ──────────────────────────────────────────────
+    raw_title = product["title"]
+    lines = textwrap.wrap(raw_title, width=38)[:3]
+    for line in lines:
+        h = draw_centered_text(draw, line, ty, f_title, (255,255,255), W)
+        ty += h + 8
+    ty += 12
+
+    # ── Preço original + desconto ──────────────────────────────────────────
+    if orig and orig > price and disc_pct >= 5:
+        orig_str = format_brl(orig)
+        bb2 = draw.textbbox((0,0), f"De: {orig_str}", font=f_orig)
+        ow  = bb2[2]-bb2[0]
+        ox  = (W - ow) // 2
+        draw.text((ox, ty), f"De: {orig_str}", font=f_orig, fill=(180,180,180))
+        # Linha riscada
+        mid_y = ty + (bb2[3]-bb2[1])//2
+        draw.line([(ox, mid_y), (ox+ow, mid_y)], fill=(180,180,180), width=3)
+        ty += bb2[3]-bb2[1] + 10
+
+        disc_txt = f"  -{disc_pct}% OFF  "
+        bb3 = draw.textbbox((0,0), disc_txt, font=f_disc)
+        dw, dh = bb3[2]-bb3[0]+20, bb3[3]-bb3[1]+16
+        dx = (W - dw) // 2
+        draw.rounded_rectangle([dx, ty, dx+dw, ty+dh], radius=10, fill=(210,20,20))
+        draw.text((dx+10, ty+8), disc_txt, font=f_disc, fill=(255,255,255))
+        ty += dh + 14
+
+    # ── Preço atual ────────────────────────────────────────────────────────
+    price_str = format_brl(price)
+    bb4 = draw.textbbox((0,0), price_str, font=f_price)
+    pw  = bb4[2]-bb4[0]
+    draw.text(((W-pw)//2+3, ty+3), price_str, font=f_price, fill=(0,0,0,180))
+    draw.text(((W-pw)//2, ty),   price_str, font=f_price, fill=(255,255,255))
+
+    # ── CTA (rodapé fixo) ──────────────────────────────────────────────────
+    cta = "Ver oferta em: www.piscoulevou.com.br"
+    canvas.alpha_composite(Image.new("RGBA", (W, 64), (0,0,0,200)), (0, H-74))
+    bb5 = draw.textbbox((0,0), cta, font=f_cta)
+    cw  = bb5[2]-bb5[0]
+    draw.text(((W-cw)//2, H-62), cta, font=f_cta, fill=(255,255,255))
+
+    # Salva
+    canvas.convert("RGB").save(out_path, "JPEG", quality=95)
+    log(f"✅ Frame composto: {out_path}")
+    return True
+
+
+def create_short_video(product: dict, output_path: str) -> bool:
+    """Cria vídeo vertical 1080x1920 com Pillow + FFmpeg simples."""
+    frame_path = output_path.replace(".mp4", "_frame.jpg")
+    if not create_frame_image(product, frame_path):
+        return False
+
     cmd = [
         "ffmpeg", "-y",
         "-loop", "1",
-        "-i", img_path,
-        "-vf", vf_filter,
-        "-map", "[final]",
-        "-t", "20",              # 20 segundos
+        "-i", frame_path,
+        "-t", "20",           # 20 segundos
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         "-r", "30",
         "-preset", "fast",
-        "-crf", "23",
+        "-crf", "22",
         output_path,
     ]
-
-    log(f"🎬 Gerando vídeo via FFmpeg...")
+    log("🎬 Convertendo frame → vídeo MP4 via FFmpeg...")
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode != 0:
-            log(f"❌ FFmpeg stderr: {result.stderr[-500:]}")
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            log(f"❌ FFmpeg stderr: {r.stderr[-400:]}")
             return False
         log(f"✅ Vídeo gerado: {output_path}")
         return True
-    except subprocess.TimeoutExpired:
-        log("❌ FFmpeg timeout (120s)")
-        return False
     except Exception as e:
         log(f"❌ FFmpeg erro: {e}")
         return False
 
 
-# ─── YouTube OAuth ─────────────────────────────────────────────────────────────
+# ─── YouTube ──────────────────────────────────────────────────────────────────
 
 def get_youtube_service():
-    """Obtém cliente autenticado do YouTube."""
     creds = Credentials(
         token=None,
         refresh_token=YOUTUBE_REFRESH_TOKEN,
@@ -273,94 +250,58 @@ def get_youtube_service():
     return build("youtube", "v3", credentials=creds)
 
 
-# ─── Upload para YouTube ───────────────────────────────────────────────────────
-
-def build_description(product: dict) -> str:
-    price   = product["price"]
-    orig    = product.get("original_price")
-    disc    = product.get("discount_pct", 0) or 0
-    if orig and orig > price:
-        disc = round((orig - price) / orig * 100)
-    codigo  = product.get("codigo_identificador", "")
-    link    = product.get("affiliate_link", SITE_URL)
-    plat    = "Shopee" if product.get("platform") == "shopee" else "Mercado Livre"
-
-    lines = [
-        f"🔥 OFERTA #{codigo} — {product['title']}",
-        "",
-        f"💰 Por apenas R$ {price:.2f}".replace(".", ","),
+def build_description(p: dict) -> str:
+    price  = p["price"]
+    orig   = p.get("original_price")
+    disc   = p.get("discount_pct") or 0
+    if orig and orig > price: disc = round((orig-price)/orig*100)
+    codigo = p.get("codigo_identificador","")
+    link   = p.get("affiliate_link", SITE_URL)
+    plat   = "Shopee" if p.get("platform")=="shopee" else "Mercado Livre"
+    lines  = [
+        f"🔥 OFERTA #{codigo} — {p['title']}","",
+        f"💰 {format_brl(price)}",
     ]
-    if orig and orig > price and disc >= 5:
-        lines.append(f"🏷️ De R$ {orig:.2f} — {disc}% OFF!".replace(".", ","))
-    lines += [
-        "",
-        f"👉 Garantir agora: {link}",
-        "",
-        f"📲 Ou acesse {SITE_URL} e busque pelo código #{codigo}",
-        "",
-        "─" * 30,
-        f"🛒 Oferta {plat} verificada via API",
-        "⚡ Atualizado em tempo real | Pode acabar a qualquer momento",
-        "",
-        f"#shorts #oferta #desconto #{plat.lower().replace(' ', '')} #piscoulevou #achados #promoção #economize #{codigo}",
-    ]
+    if orig and orig>price and disc>=5:
+        lines.append(f"🏷️ De {format_brl(orig)} — {disc}% OFF!")
+    lines += ["",f"👉 Garantir agora: {link}","",
+              f"📲 Ou acesse {SITE_URL} e busque #{ codigo}","",
+              "─"*30,f"Oferta {plat} verificada via API","",
+              f"#shorts #oferta #desconto #{plat.lower().replace(' ','')} #piscoulevou #achados #promoção #{codigo}"]
     return "\n".join(lines)
 
 
-def upload_to_youtube(youtube, video_path: str, product: dict) -> str | None:
-    """Faz upload do vídeo para o YouTube como Short."""
-    price  = product["price"]
-    disc   = product.get("discount_pct", 0) or 0
-    orig   = product.get("original_price")
-    if orig and orig > price:
-        disc = round((orig - price) / orig * 100)
-    
-    codigo = product.get("codigo_identificador", "")
-    plat   = "Shopee" if product.get("platform") == "shopee" else "Mercado Livre"
-
-    title = f"#{codigo} {product['title'][:60]} — {disc}% OFF #shorts"
-    if len(title) > 100:
-        title = title[:97] + "..."
+def upload_to_youtube(youtube, video_path: str, p: dict):
+    price = p["price"]
+    orig  = p.get("original_price")
+    disc  = p.get("discount_pct") or 0
+    if orig and orig > price: disc = round((orig-price)/orig*100)
+    codigo = p.get("codigo_identificador","")
+    plat   = "Shopee" if p.get("platform")=="shopee" else "Mercado Livre"
+    disc_s = f" — {disc}% OFF" if disc>=5 else ""
+    title  = f"#{codigo} {p['title'][:55]}{disc_s} #shorts"[:100]
 
     body = {
         "snippet": {
             "title":       title,
-            "description": build_description(product),
-            "tags": [
-                "oferta", "desconto", "promoção", "shorts", "piscoulevou",
-                plat.lower(), "achados", "economize", str(codigo),
-            ],
-            "categoryId":  "26",   # How-to & Style (bom para produtos)
+            "description": build_description(p),
+            "tags":        ["oferta","desconto","promoção","shorts","piscoulevou",
+                            plat.lower(),str(codigo),"economize","achados"],
+            "categoryId":  "26",
         },
-        "status": {
-            "privacyStatus": "public",
-            "selfDeclaredMadeForKids": False,
-        },
+        "status": {"privacyStatus":"public","selfDeclaredMadeForKids":False},
     }
-
-    media = MediaFileUpload(
-        video_path,
-        mimetype="video/mp4",
-        resumable=True,
-        chunksize=5 * 1024 * 1024,  # 5MB chunks
-    )
-
-    log(f"📤 Fazendo upload para o YouTube...")
+    media = MediaFileUpload(video_path, mimetype="video/mp4", resumable=True, chunksize=5*1024*1024)
+    log("📤 Fazendo upload para o YouTube...")
     try:
-        request = youtube.videos().insert(
-            part="snippet,status",
-            body=body,
-            media_body=media,
-        )
+        req = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
         response = None
         while response is None:
-            status, response = request.next_chunk()
-            if status:
-                log(f"   Upload: {int(status.progress() * 100)}%")
-        
-        video_id = response.get("id")
-        log(f"✅ Vídeo publicado: https://youtube.com/shorts/{video_id}")
-        return video_id
+            status, response = req.next_chunk()
+            if status: log(f"   Upload: {int(status.progress()*100)}%")
+        vid = response.get("id")
+        log(f"✅ Short publicado: https://youtube.com/shorts/{vid}")
+        return vid
     except Exception as e:
         log(f"❌ Erro no upload: {e}")
         return None
@@ -370,53 +311,39 @@ def upload_to_youtube(youtube, video_path: str, product: dict) -> str | None:
 
 def main():
     log("🚀 PiscouLevou — YouTube Shorts Auto-Post")
+    last = get_last_platform()
+    nxt  = "mercadolivre" if last=="shopee" else "shopee"
+    log(f"🔄 {last} → {nxt}")
 
-    # Determina próxima plataforma (alternância ML ↔ Shopee)
-    last_platform = get_last_platform()
-    next_platform = "mercadolivre" if last_platform == "shopee" else "shopee"
-    log(f"🔄 Plataforma: {last_platform} → {next_platform}")
-
-    # Busca produto
-    product = pick_product(next_platform)
+    product = pick_product(nxt)
     if not product:
-        log(f"⚠️  Sem produtos disponíveis para {next_platform}, tentando outra plataforma...")
-        alt = "shopee" if next_platform == "mercadolivre" else "mercadolivre"
+        alt = "shopee" if nxt=="mercadolivre" else "mercadolivre"
         product = pick_product(alt)
         if not product:
-            log("❌ Nenhum produto disponível. Encerrando.")
-            sys.exit(0)
-        next_platform = alt
+            log("❌ Sem produtos disponíveis."); sys.exit(0)
+        nxt = alt
 
-    log(f"📦 Produto selecionado: #{product.get('codigo_identificador')} — {product['title'][:60]}")
-    log(f"   Preço: R$ {product['price']:.2f} | Plataforma: {product.get('platform')}")
+    log(f"📦 #{product.get('codigo_identificador')} — {product['title'][:60]}")
+    log(f"   Preço: {format_brl(product['price'])} | {product.get('platform')}")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        video_path = str(Path(tmpdir) / "short.mp4")
+    with tempfile.TemporaryDirectory() as tmp:
+        video_path = str(Path(tmp) / "short.mp4")
+        if not create_short_video(product, video_path):
+            log("❌ Falha ao gerar vídeo."); sys.exit(1)
 
-        # Gera vídeo
-        ok = create_short_video(product, video_path)
-        if not ok:
-            log("❌ Falha na geração do vídeo.")
-            sys.exit(1)
-
-        # Autentica no YouTube
-        log("🔐 Autenticando no YouTube...")
+        log("🔐 Autenticando YouTube...")
         try:
-            youtube = get_youtube_service()
+            yt = get_youtube_service()
         except Exception as e:
-            log(f"❌ Falha na autenticação YouTube: {e}")
-            sys.exit(1)
+            log(f"❌ Auth falhou: {e}"); sys.exit(1)
 
-        # Upload
-        video_id = upload_to_youtube(youtube, video_path, product)
-        if not video_id:
-            log("❌ Upload falhou.")
-            sys.exit(1)
+        vid_id = upload_to_youtube(yt, video_path, product)
+        if not vid_id:
+            log("❌ Upload falhou."); sys.exit(1)
 
-        # Marca como postado
         mark_posted(product["id"])
-        set_last_platform(next_platform)
-        log(f"✅ Concluído! Short: https://youtube.com/shorts/{video_id}")
+        set_last_platform(nxt)
+        log(f"🎉 Concluído! https://youtube.com/shorts/{vid_id}")
 
 
 if __name__ == "__main__":
