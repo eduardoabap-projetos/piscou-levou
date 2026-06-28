@@ -1,0 +1,48 @@
+name: YouTube Shorts Auto-Post
+
+on:
+  schedule:
+    # 3x ao dia — horários BRT (UTC-3)
+    - cron: '0 12 * * *'   # 09:00 BRT
+    - cron: '0 17 * * *'   # 14:00 BRT
+    - cron: '0 22 * * *'   # 19:00 BRT
+  workflow_dispatch:        # Permite execução manual pelo GitHub
+
+jobs:
+  post-short:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Instalar FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version | head -1
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Instalar dependências Python
+        run: |
+          pip install --quiet \
+            requests \
+            google-auth \
+            google-auth-oauthlib \
+            google-api-python-client \
+            Pillow
+
+      - name: Postar YouTube Short
+        env:
+          SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          YOUTUBE_CLIENT_ID:         ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET:     ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN:     ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+        run: python scripts/youtube_shorts.py

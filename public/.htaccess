@@ -1,0 +1,10 @@
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteBase /
+
+  # If the request is for a category page that doesn't physically exist,
+  # rewrite it internally to the Next.js static placeholder template
+  RewriteCond %{REQUEST_FILENAME} !-f
+  RewriteCond %{REQUEST_FILENAME} !-d
+  RewriteRule ^category/([^/]+)/?$ category/_placeholder/index.html [L]
+</IfModule>
