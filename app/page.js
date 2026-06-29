@@ -52,6 +52,12 @@ export default function HomePage() {
   const [minDiscount,  setMinDiscount]  = useState(0);
   const [activeCategory, setActiveCategory] = useState('all');
   const [activePlatform, setActivePlatform] = useState('all'); // 'all' | 'mercadolivre' | 'shopee'
+  const [expandedCats,   setExpandedCats]   = useState({}); // { [catId]: true } quando expandido
+
+  const PREVIEW_COUNT = 5; // produtos visíveis por padrão por categoria
+
+  const toggleCat = (catId) =>
+    setExpandedCats((prev) => ({ ...prev, [catId]: !prev[catId] }));
   const [isMobile,     setIsMobile]     = useState(false);
 
   // ── Instagram code search widget ───────────────────────────────
@@ -457,37 +463,69 @@ export default function HomePage() {
                 </Link>
               </div>
 
-              {/* Sub-grupos por subcategoria */}
-              <div className="p-5 space-y-0">
-                {groups.map(([subcatName, subcatProds], idx) => {
-                  const sorted  = sortList(subcatProds);
-                  const isNamed = subcatName !== null;
-                  return (
-                    <div
-                      key={subcatName ?? '__root__'}
-                      className="rounded-xl overflow-hidden border border-slate-200"
-                      style={{ marginTop: idx > 0 ? '16px' : '0' }}
-                    >
-                      {isNamed && (
-                        <div className="bg-[#0F172A] px-5 py-3 flex items-center justify-between">
-                          <div className="flex items-center gap-2">
-                            <span className="w-1.5 h-5 bg-[#FF5A00] rounded-full" />
-                            <h3 className="text-white font-black text-xs uppercase tracking-wider">
-                              {subcatName}
-                            </h3>
-                          </div>
-                          <span className="text-slate-400 text-[11px] font-semibold">
-                            {sorted.length} produto{sorted.length !== 1 ? 's' : ''}
-                          </span>
-                        </div>
-                      )}
-                      <div className="bg-white p-4">
-                        <ProductGrid products={sorted} loading={false} skeletonCount={4} />
+              {/* Produtos da categoria — limitados por padrão */}
+              {(() => {
+                // Junta todos os produtos da categoria em uma lista ordenada
+                const allCatProds = groups.flatMap(([, prods]) => sortList(prods));
+                const isExpanded  = !!expandedCats[cat.id];
+                const visible     = isExpanded ? allCatProds : allCatProds.slice(0, PREVIEW_COUNT);
+                const hasMore     = allCatProds.length > PREVIEW_COUNT;
+
+                return (
+                  <div className="p-5">
+                    <ProductGrid products={visible} loading={false} skeletonCount={4} />
+
+                    {hasMore && (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginTop: '18px' }}>
+                        <button
+                          onClick={() => toggleCat(cat.id)}
+                          id={`expand-cat-${cat.slug}`}
+                          style={{
+                            flex: 1,
+                            height: '42px',
+                            background: isExpanded ? '#F1F5F9' : 'linear-gradient(135deg,#FF5A00,#FF8C00)',
+                            color: isExpanded ? '#64748b' : 'white',
+                            border: 'none',
+                            borderRadius: '12px',
+                            fontWeight: '800',
+                            fontSize: '13px',
+                            cursor: 'pointer',
+                            transition: 'all 0.2s',
+                          }}
+                        >
+                          {isExpanded
+                            ? `▲ Mostrar menos`
+                            : `▼ Ver mais ${allCatProds.length - PREVIEW_COUNT} produto${allCatProds.length - PREVIEW_COUNT !== 1 ? 's' : ''}`
+                          }
+                        </button>
+                        {!isExpanded && (
+                          <Link
+                            href={`/category/${cat.slug}/`}
+                            id={`see-all-cat-${cat.slug}`}
+                            style={{
+                              height: '42px',
+                              padding: '0 16px',
+                              background: 'white',
+                              border: '2px solid #FF5A00',
+                              borderRadius: '12px',
+                              color: '#FF5A00',
+                              fontWeight: '800',
+                              fontSize: '13px',
+                              textDecoration: 'none',
+                              display: 'flex',
+                              alignItems: 'center',
+                              whiteSpace: 'nowrap',
+                              transition: 'all 0.2s',
+                            }}
+                          >
+                            Ver página →
+                          </Link>
+                        )}
                       </div>
-                    </div>
-                  );
-                })}
-              </div>
+                    )}
+                  </div>
+                );
+              })()}
             </section>
           ))
         )}
